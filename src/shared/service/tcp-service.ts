@@ -1,0 +1,579 @@
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import * as net from 'net';
+import { LoggerService } from '../logger/logger.service';
+import * as iconv from 'iconv-lite';
+import { TraceService } from 'src/trace/trace.service';
+import * as fs from 'fs';
+import portfinder from 'portfinder';
+import { resolve } from 'path';
+
+@Injectable()
+export class TcpService implements OnModuleInit, OnModuleDestroy  {
+  private readonly host: string = process.env.TCP_HOST;
+  private readonly port: number = +process.env.KISOFT_IN_PORT;
+  private client: net.Socket;
+  private readonly timeoutRead: number = 3000;
+  private isConnected = false;
+  private sendQueue: { id: number; trama: string; resolve: (response: string) => void; reject: (error: any) => void }[] = [];
+  private pendingResponses: Map<number, (response: string) => void> = new Map();
+  private currentSending: { id: number; trama: string } | null = null;
+  private initializingSocket = false;
+  private processing = false;
+  private processInterval: NodeJS.Timeout = null;
+  private heartbeatInterval: NodeJS.Timeout = null;
+  private lastHeartbeatTimestamp = 0;
+  private readonly heartbeatMessage = '000081HR';
+  private heartbeatDisconect: NodeJS.Timeout = null;
+  private lastHeartbeatDisconect = 0;
+  private reintentosHeartbeatDisconect = 0;
+  private disconectReceived = 0;
+  private disconectfromServer = 0;
+  private reintentosHearbeatSinRespuesta = 0;
+  private reintentosEnvioSinRespuesta = 0;
+  private reconectando = false;
+  private conectadoTimestamp = 0;
+  private validandoConexion = false;
+  private readonly PORT_FILE = './local-port.txt';
+  private localPort: number;
+  localPortToReuse: number | null = null;
+
+  constructor(private readonly logger: LoggerService,
+              private readonly traceService: TraceService
+  ) {};
+
+  async onModuleInit() {
+    this.logger.logError(`*** onModuleInit ***`);
+    this.localPort = await this.loadOrAssignLocalPort();
+    this.initSocket();
+  }
+
+  onModuleDestroy() {
+    this.logger.logError('*** onModuleDestroy ****');
+    this.cleanupSocket();
+  }
+
+  private async loadOrAssignLocalPort(): Promise<number> {
+    if (fs.existsSync(this.PORT_FILE)) {
+      const savedPort = parseInt(fs.readFileSync(this.PORT_FILE, 'utf8'), 10);
+      if (!isNaN(savedPort)) return savedPort;
+    }
+  
+    try {
+      const port = await portfinder.getPortPromise();
+      fs.writeFileSync(this.PORT_FILE, port.toString());
+      return port;
+    } catch (err) {
+      this.logger.logError(`Error asignando puerto local: ${err.message}`);
+      throw err;
+    }
+  }
+
+  private initSocket() {
+    this.reconectando = false;
+    this.validandoConexion = false;
+
+    /*if (this.initializingSocket) {
+      this.logger.logError('initSocket ya en curso, ignorado');
+      this.reintentosEnvioSinRespuesta = 0;
+      return;
+    }*/
+
+    if (this.client && !this.client.destroyed) {
+      this.logger.logError('initSocket - Socket ya existente, no se recrea');
+      this.reintentosEnvioSinRespuesta = 0;
+      return;
+    }
+
+    this.client = new net.Socket();
+    this.client.setKeepAlive(true, 10000);
+    this.initializingSocket = true;
+
+    const options: net.NetConnectOpts = {
+      host: this.host,
+      port: this.port, // puerto del servidor remoto
+      ...(this.localPortToReuse ? { localPort: this.localPortToReuse } : {}),
+    };
+
+    this.client.connect(options, () => {
+      this.logger.logError(`Connected to TCP server at ${this.host}:${this.port} localPort ${this.client.localPort}`);
+
+      if (!this.localPortToReuse) {
+        this.localPortToReuse = this.client.localPort;
+        console.log(`Puerto local usado por primera vez: ${this.localPortToReuse}`);
+      } else {
+        console.log(`Reconectado usando el puerto local: ${this.localPortToReuse}`);
+      }
+
+      this.conectadoTimestamp = Date.now();
+      this.initConnect();
+    });
+
+   /* this.client.connect(this.port, this.host, () => {
+      this.logger.logError(`Connected to TCP server at ${this.host}:${this.port}`);
+      this.conectadoTimestamp = Date.now();
+      this.initConnect();
+    });*/
+
+    /*
+    this.client = net.createConnection({
+      host: this.host,
+      port: this.port,
+      localPort: 30002, // ← Aquí fijas el puerto local
+    }, () => {
+      this.logger.logError(`Connected to TCP server at ${this.host}:${this.port}`);
+      this.conectadoTimestamp = Date.now();
+      this.initConnect();
+    });
+    */
+/*
+    this.checkPortAvailability(this.localPort).then((isAvailable) => {
+      if (isAvailable) {
+        this.client = net.createConnection({
+          host: this.host,
+          port: this.port,
+          localPort: this.localPort,
+        }, () => {
+          this.logger.logError(`Connected to TCP server at ${this.host}:${this.port}`);
+          this.conectadoTimestamp = Date.now();
+          this.initConnect();
+        });
+      } else {
+        this.logger.logError(`Puerto local ${this.localPort} ya está en uso. Intentando liberar...`);
+        this.cleanupSocket();
+        this.initSocket();
+      }
+    }).catch((error) => {
+      this.logger.logError(`Error al verificar el puerto local ${this.localPort}: ${error.message}`);
+    });
+*/
+
+    this.client.on('data', async (data) => {
+      try {
+        this.reintentosHearbeatSinRespuesta = 0;
+        const received = data.toString().trim();
+        this.logger.logError(`Received data: ${received}`);
+        await this.processesReceivedData(received);
+      } catch (error) {
+        this.logger.logError(`Error en datos recibidos: ${error.message}`, error.stack);
+      } 
+    });
+
+    this.client.on('error', (err) => {
+      this.logger.logError(`Connection error: ${err.message}`, err.stack);
+      this.isConnected = false;
+      
+
+      /*if(this.disconectReceived == 2) {
+        this.sendHearbetWithDisconect();
+      }*/
+      
+      this.reconnect();
+    });
+
+    this.client.on('close', () => {
+      this.logger.logError(`*****CONNECTION CLOSE*****`);
+      this.validConnection();
+      
+      
+      //this.isConnected = false;
+      /*
+      this.disconectReceived = this.disconectReceived + 1;
+
+      this.logger.logError(`Connection closed - disconectReceived = ${this.disconectReceived}`);
+
+      if(this.disconectReceived == 2) {
+        this.disconectReceived = 0;
+        this.logger.logError(`*** INIT Herbaet with disconect POR EVENTO CLOSE ***`);
+        //this.sendHearbetWithDisconect();
+      }
+        */
+      //this.reconnect();
+    });
+
+    this.client.on('end', () => {
+      this.logger.logError(`*****CONNECTION CLOSE FROM SERVER*****`);
+      this.validConnection();
+      //this.isConnected = false;
+      /*      
+      this.disconectfromServer = this.disconectfromServer + 1;
+
+      this.logger.logError(`Connection closed from server - disconectfromServer = ${this.disconectfromServer}`);
+
+      if(this.disconectfromServer == 2) {
+        this.disconectfromServer = 0;
+        this.logger.logError(`*** INIT Herbaet with disconect POR EVENTO END ***`);
+        this.sendHearbetWithDisconect();
+      }
+        */
+      //this.reconnect();
+    });
+
+    this.client.setTimeout(0);
+  }
+
+  private async checkPortAvailability(port: number): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      const tester = net.createServer().listen(port, this.port);
+      
+      tester.on('listening', () => {
+        tester.close(() => resolve(true));  // Si se puede abrir el puerto, está disponible
+      });
+
+      tester.on('error', (err) => {
+        if (err) {
+          // Aquí puedes acceder a `err.code` de forma segura
+          this.logger.logError(`Connection error: ${err.message}`);
+        } else {
+          // Si no existe el código, solo muestra el mensaje
+          this.logger.logError(`Connection error: ${err.message}`);
+        }
+      });
+    });
+  }
+
+  validConnection() {
+    if(this.validandoConexion) {
+      return;
+    }     
+    
+    this.validandoConexion = true;
+
+    const now = Date.now();
+    const timeActual = now - this.conectadoTimestamp;
+
+    this.logger.logError(`close - now = ${now}`);
+    this.logger.logError(`close - timeActual = ${timeActual}`);
+    
+    if(timeActual >= 100000) {
+      this.isConnected = false;
+      this.reconnect();
+    }
+  }
+
+  async initConnect() {
+    try {
+      //this.stopHeartbeatWithDisconect();
+
+      if (this.processInterval) {
+        clearInterval(this.processInterval);
+      }
+
+      this.isConnected = true;
+      this.startProcess();
+      //this.startHeartbeat();
+
+    } finally {
+      this.initializingSocket = false;
+    }
+  }
+
+  async processesReceivedData(received: string) {
+    try {
+      //this.stopHeartbeatWithDisconect();
+      this.reintentosHearbeatSinRespuesta = 0;
+      this.reintentosEnvioSinRespuesta = 0;
+      this.reintentosHeartbeatDisconect = 0;
+      this.disconectfromServer = 0;
+      this.disconectReceived = 0;
+      this.isConnected = true;
+      
+      if(received == '000102HR00') {
+        this.logger.logError(`Se recibió un hearbeat`);
+      }
+      else {
+        this.logger.logError(`Received data - currentSending = `, JSON.stringify(this.currentSending, null, 2));
+        this.logger.logError(`Received data - pendingResponses = `, JSON.stringify(this.pendingResponses, null, 2));
+  
+        if (this.currentSending) {
+          const { id } = this.currentSending;
+    
+          // Procesar la respuesta
+          const resolve = this.pendingResponses.get(id);
+          if (resolve) {
+            resolve(received);
+            this.pendingResponses.delete(id);
+          }
+    
+          await this.traceService.update(id, received);
+          this.currentSending = null;
+        }
+        else {
+          this.logger.logError(`No se esperaba la respuesta ${received}`);
+        }
+      }    
+    } catch (error) {
+      this.logger.logError(`Error enviando trama: ${error.message}`, error.stack);
+    }   
+  }
+
+  private reconnect() {
+    if(this.reconectando) {
+      return;
+    }
+    this.reconectando = true;
+    //this.stopHeartbeatWithDisconect();
+    this.reintentosHearbeatSinRespuesta = 0;
+    this.reintentosHeartbeatDisconect = 0;
+    this.disconectfromServer = 0;
+    this.disconectReceived = 0;
+    this.reintentosEnvioSinRespuesta = 0;
+
+    this.cleanupSocket();
+
+    this.logger.logError('***RECONECTANDOSE***');
+    setTimeout(() => this.initSocket(), 3000);
+  }
+
+  async sendMessage(id: number, trama: string, interfaceName: string): Promise<string> {
+    return new Promise(async (resolve, reject) => {
+      this.logger.logError(`sendMessage - interface = ${interfaceName} - nueva trama = ${trama}`);
+      this.sendQueue.push({ id, trama, resolve, reject });      
+    });
+  }
+
+  private startProcess() {
+    this.processInterval = setInterval(async () => {
+      if(this.sendQueue.length > 0) {
+        await this.processQueue();
+      }
+    }, 1000);
+  }
+
+  private async processQueue() {
+    if (this.processing) return;
+    this.processing = true;
+
+    this.logger.logError(`processQueue - isConnected = ${this.isConnected}`);
+    this.logger.logError(`processQueue - currentSending = `, JSON.stringify(this.currentSending, null, 2));
+    this.logger.logError(`processQueue - sendQueue.length = ${this.sendQueue.length}`);
+
+    try {
+      const workData = this.isConnected && 
+                      !this.currentSending && 
+                      this.sendQueue.length > 0;
+
+      if(workData) {
+        this.logger.logError(`processQueue - se inicia el recorrido de tramas a enviar, tramas = `, JSON.stringify(this.sendQueue, null, 2));
+
+        const item = this.sendQueue[0];
+        this.logger.logError(`processQueue - se enviará la trama`, JSON.stringify(item, null, 2));
+        await this.processMessage(item);
+      }
+      else {
+        this.logger.logError(`processQueue - DESCONEXIÓN - aún no se envían tramas = `, JSON.stringify(this.sendQueue, null, 2));
+        this.reintentosEnvioSinRespuesta = this.reintentosEnvioSinRespuesta + 1;
+
+        this.logger.logError(`processQueue - reintentosEnvioSinRespuesta = ${this.reintentosEnvioSinRespuesta}`);
+        if(this.reintentosEnvioSinRespuesta >= 5) {
+          this.logger.logError(`processQueue - RECONEXIÓN = ${this.reintentosEnvioSinRespuesta}`);
+          this.reconnect();
+        }
+      }
+
+    } catch (error) {
+      this.logger.logError(`Error enviando trama: ${error.message}`, error.stack);
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  private async processMessage(item: any) {
+    try {
+
+      if(item != null) {
+        this.currentSending = { id: item.id, trama: item.trama };
+
+        if (!this.isSocketAvailable()) {
+          this.currentSending = null;
+          this.logger.logError('Socket no disponible o no writable al intentar enviar');
+          this.reconnect();
+          return;
+        }
+  
+        const timeoutPerMessage = setTimeout(() => {
+          this.logger.logError(`Timeout esperando respuesta para id: ${item.id}`);
+          this.pendingResponses.delete(item.id);
+          this.currentSending = null;
+          item.resolve?.('TIMEOUT');
+        }, this.timeoutRead);
+  
+        this.pendingResponses.set(item.id, (response: string) => {
+          clearTimeout(timeoutPerMessage);
+          item.resolve(response);
+          this.currentSending = null;
+        });
+  
+        const message = `\n${item.trama}\r`;
+        const encodedMessage = iconv.encode(message, 'ISO-8859-15');
+  
+        try {
+          const result = this.sendData(encodedMessage.toString('binary'));    
+          
+          if(result) {
+            this.logger.logError(`Trama enviada: ${encodedMessage.toString('binary')}`);
+            this.sendQueue.shift();
+          }
+          
+        } catch (error) {
+          this.logger.logError(`Error enviando trama: ${error.message}`, error.stack);
+          this.currentSending = null;
+        }
+  
+        /*if (this.sendQueue.length > 100) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }*/
+      }
+    } catch (error) {
+      this.logger.logError(`Error enviando trama: ${error.message}`, error.stack);
+    }
+  }
+
+  private sendData(data: string): boolean {
+    this.logger.logError(`sendData - datos a enviar data = ${data}`);
+
+    const flushed = this.client.write(data, (err) => {
+      if (err) {
+        this.logger.logError(`sendData - ERROR AL ENVIAR DATOS: ${err.message}`);
+        this.isConnected = false;
+        return false;
+      }
+      this.logger.logError(`sendData - datos enviadas`);
+    });
+
+    if (!flushed) {
+      this.client.once('drain', () => {
+        this.logger.logError('Buffer drenado, se completó el write');
+      });
+    }
+
+    this.logger.logError(`sendData - datos ENVIADOS CORRECTAMENTE`);
+    return true;
+  }
+
+  private cleanupSocket() {
+    this.logger.logError('cleanupSocket');
+
+    if (this.client) {
+      this.logger.logError('Cleaning up existing socket connection');
+      this.client.removeAllListeners();
+      this.client.destroy();
+      this.client.unref();
+      this.client = null;
+    }
+    this.isConnected = false;
+
+    return new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), 1000); // Espera 1 segundo (ajustable)
+    });
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+
+    this.heartbeatInterval = setInterval(async () => {
+      try{
+        const now = Date.now();
+        const time = now - this.lastHeartbeatTimestamp;
+  
+        this.logger.logError(`startHeartbeat - time = ${time}`);
+        this.logger.logError(`startHeartbeat - isConnected = ${this.isConnected}`);
+        this.logger.logError(`startHeartbeat - reconectando = ${this.reconectando}`);
+        this.logger.logError(`startHeartbeat - currentSending = ${this.currentSending}`);
+        this.logger.logError(`startHeartbeat - this.sendQueue.length === 0 = ${this.sendQueue.length === 0}`);
+  
+        const timeActual = now - this.lastHeartbeatTimestamp;
+        this.logger.logError(`startHeartbeat - timeActual = ${timeActual}`);
+  
+        const shouldSendHeartbeat = !this.currentSending &&
+                                  !this.reconectando &&
+                                  this.sendQueue.length === 0 &&
+                                  timeActual>= 30000;
+  
+        this.logger.logError(`startHeartbeat - shouldSendHeartbeat = ${shouldSendHeartbeat}`);
+        
+        if (shouldSendHeartbeat) {
+          this.logger.logError(`startHeartbeat - se inicia heartbeat`);
+  
+          if(this.reintentosHearbeatSinRespuesta >= 5) {
+            this.logger.logError(`startHeartbeat disconect - 5 reintentos - reconexión *** RECONEXIÓN POR HEARBEAT ***`);
+            this.reconnect();
+          }
+          
+          const message = `\n${this.heartbeatMessage}\r`;
+          const encodedMessage = iconv.encode(message, 'ISO-8859-15');      
+          const sended = this.sendData(encodedMessage.toString('binary'));
+  
+          if(!sended){
+            this.logger.logError(`startHeartbeat NO SE ENVIÓ HEARBEAT POR QUE NO HAY CONEXIÓN`);
+          }
+          
+          this.logger.logError(`startHeartbeat reintentosHearbeatSinRespuesta = ${this.reintentosHearbeatSinRespuesta}`);
+          this.reintentosHearbeatSinRespuesta = this.reintentosHearbeatSinRespuesta + 1;
+          this.lastHeartbeatTimestamp = Date.now();
+          this.logger.logError('Heartbeat enviado');
+        }
+      }
+      catch (error) {
+        this.logger.logError(`startHeartbeat - Error en prceso de heartbeat: ${error.message}`, error.stack);
+      }
+    }, 1000);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  private sendHearbetWithDisconect() {
+    this.stopHeartbeat();
+    this.reintentosHeartbeatDisconect = 0;
+    this.lastHeartbeatDisconect = 0;
+
+    this.heartbeatDisconect = setInterval(async () => {
+      const now = Date.now();
+      const time = this.lastHeartbeatDisconect > 0 ? now - this.lastHeartbeatDisconect : 0;
+
+      this.logger.logError(`sendHearbetWithDisconect - time = ${time}`);
+      this.logger.logError(`sendHearbetWithDisconect - lastHeartbeatDisconect = ${this.lastHeartbeatDisconect}`);
+
+      const shouldSendHeartbeat = !this.isConnected &&
+                                  now - this.lastHeartbeatTimestamp >= 30000;
+
+      const tiempoTranscurrido = now - this.lastHeartbeatTimestamp;
+      this.logger.logError(`sendHearbetWithDisconect tiempoTranscurrido = ${tiempoTranscurrido}`);
+      this.logger.logError(`sendHearbetWithDisconect shouldSendHeartbeat = ${shouldSendHeartbeat}`);
+
+      if (shouldSendHeartbeat) {
+        this.logger.logError(`sendHearbetWithDisconect disconect - se inicia heartbeat`);
+
+        if(this.reintentosHeartbeatDisconect >= 3) {
+          this.isConnected = false;
+          this.logger.logError(`sendHearbetWithDisconect disconect - 3 reintentos - *** RECONEXIÓN POR HEARBEAT WITH DISCONECT ***`);
+          this.reconnect();
+        }
+        
+        const message = `\n${this.heartbeatMessage}\r`;
+        const encodedMessage = iconv.encode(message, 'ISO-8859-15');      
+        const sended = this.sendData(encodedMessage.toString('binary'));        
+        
+        this.lastHeartbeatDisconect = Date.now();
+        this.logger.logError('sendHearbetWithDisconect disconect enviado');
+        this.logger.logError(`sendHearbetWithDisconect reintentosHeartbeatDisconect = ${this.reintentosHeartbeatDisconect}`);
+        this.reintentosHeartbeatDisconect = this.reintentosHeartbeatDisconect + 1;
+      }
+    }, 1000);
+  }
+
+  private stopHeartbeatWithDisconect() {
+    if (this.heartbeatDisconect) {
+      clearInterval(this.heartbeatDisconect);
+      this.heartbeatDisconect = null;
+    }
+  }
+
+  private isSocketAvailable(): boolean {
+    return this.client && !this.client.destroyed && this.client.writable;
+  }
+}
