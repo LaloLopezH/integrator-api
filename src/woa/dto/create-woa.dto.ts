@@ -540,4 +540,7 @@ export class CreateWoaDto {
 
     @IsOptional()
     ModifiedUser?: number;
+
+    @IsOptional()
+    flg_print?: boolean;
 }

@@ -3,18 +3,21 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { TSequence } from 'src/woa/entities/tsequence.entity';
 import { TSequenceDetail } from 'src/woa/entities/tsequence-detail.entity';
+import { SystemParameter } from '../entities/system-parameter.entity';
 
 @Injectable()
 export class SeederService {
   constructor(
     @InjectRepository(TSequence) private readonly tsecuenceRepository: Repository<TSequence>,
     @InjectRepository(TSequenceDetail) private readonly tsecuenceDetailsRepository: Repository<TSequenceDetail>,
+    @InjectRepository(SystemParameter) private readonly systemParameterRepository: Repository<SystemParameter>,
   ) {}
 
   async seed(): Promise<void> {
     console.log("CARGANDO SEEDERS");
     //await this.createSequences();
     //await this.createSequenceDetails();
+    //await this.createWoaSystemParameters();
   }
 
   private async createSequences(): Promise<void> {
@@ -163,5 +166,51 @@ export class SeederService {
         await this.tsecuenceDetailsRepository.save(newSequenceDetail);
       }
     }    
+  }
+
+  private async createWoaSystemParameters(): Promise<void> {
+    const woaParameters = [
+      {
+        interface_name: 'WOA',
+        parameter_name: 'VOLUMEN_LINEA_THRESHOLD',
+        parameter_value: '18000',
+        description: 'Umbral de volumen de línea para determinar el flujo de procesamiento. Si la suma de volumen_linea > VOLUMEN_LINEA_THRESHOLD, se aplican reglas especiales.',
+        CreatedDate: new Date(),
+        CreatedUser: 3,
+      },
+      {
+        interface_name: 'WOA',
+        parameter_name: 'OBLPN_TYPES',
+        parameter_value: '06,07',
+        description: 'Tipos de ob_lpn_type que aplican para la lógica de volumenOverLimit y envioChequeo. Formato: valores separados por comas (ej: 06,07 o 07,08,09).',
+        CreatedDate: new Date(),
+        CreatedUser: 3,
+      },
+      {
+        interface_name: 'WOA',
+        parameter_name: 'CUSTOMER_EXCEPTIONS',
+        parameter_value: 'C015883',
+        description: 'Códigos de clientes (woa.cust_nbr) para la lógica de tramas con ob_lpn_type = 2 y que deben enviarse las secciones SEC3 Y SEC4 y generar el archivo de impresión. Formato: valores separados por comas (ej: C002258,C000706,C012219).',
+        CreatedDate: new Date(),
+        CreatedUser: 3,
+      }
+    ];
+
+    for (const param of woaParameters) {
+      const existing = await this.systemParameterRepository.findOne({
+        where: {
+          interface_name: param.interface_name,
+          parameter_name: param.parameter_name,
+        },
+      });
+
+      if (!existing) {
+        const newParameter = this.systemParameterRepository.create(param);
+        await this.systemParameterRepository.save(newParameter);
+        console.log(`Parámetro WOA creado: ${param.interface_name}.${param.parameter_name} = ${param.parameter_value}`);
+      } else {
+        console.log(`Parámetro WOA ya existe: ${param.interface_name}.${param.parameter_name}`);
+      }
+    }
   }
 }

@@ -9,11 +9,12 @@ import { SftpPrintService } from "src/shared/service/sftp-print-service";
 import { TextService } from "src/shared/service/text.service";
 import { SequenceService } from "./secuence.service";
 import { SequenceDetailService } from "./secuence-detail.service";
+import { WoaCalculationService } from "./woa-calculation.service";
+import { WoaConfigService } from "./config/woa-config.service";
 
 
 @Injectable()
 export class PrintFileService {
-    //private readonly printFileDirectory = path.resolve(__dirname, `../${process.env.DIRECTORY_PRINT_FILES}`);
     private readonly printFileDirectory = process.env.DIRECTORY_PRINT_FILES;
     
     constructor(private readonly apiService: ApiService,
@@ -22,26 +23,36 @@ export class PrintFileService {
                 private readonly textService: TextService,
                 private readonly sequenceService: SequenceService,
                 private readonly sequenceDetailService: SequenceDetailService,
+                private readonly woaCalculationService: WoaCalculationService,
+                private readonly woaConfigService: WoaConfigService,
     ){}
     
     async generatePrintFile(data: CreateWoaDto[]) {
+      if (!data || data.length === 0) {
+        this.logger.logError(`generatePrintFile - No se recibieron datos para procesar`);
+        return;
+      }
+
+      if (!data[0] || !data[0].facility_code) {
+        this.logger.logError(`generatePrintFile - Error: facility_code no está disponible en los datos recibidos`);
+        return;
+      }
+
       const facilityCode = data[0].facility_code;
       const oblpnList:string[] = [];
       
       try
       {
         for (const dto of data) {
-          this.logger.logError(`generatePrintFile - action_code = ${dto.action_code} - oblpn= ${dto.oblpn} - ob_lpn_type = ${dto.ob_lpn_type}`);
+          this.logger.logError(`generatePrintFile - action_code = ${dto.action_code} - oblpn= ${dto.oblpn} - ob_lpn_type = ${dto.ob_lpn_type} - flg_print = ${dto.flg_print}`);
           
-          var resultValidateEstaction152 = await this.validateEstacion152(dto, data);
-
-          this.logger.logError(`dto.action_code: ${dto.action_code}`);
-          this.logger.logError(`dto.oblpn: ${dto.oblpn}`);
-          this.logger.logError(`oblpn:${dto.oblpn} - resultValidateEstaction152: ${resultValidateEstaction152}`);
-          
-          if (dto.action_code === 'CREATE' && !this.validateNullString(dto.oblpn) && resultValidateEstaction152) {
-            this.logger.logError(`generatePrintFile - oblpn= ${dto.oblpn} agregado`);
-            oblpnList.push(dto.oblpn);
+          if (dto.action_code === 'CREATE' && !this.validateNullString(dto.oblpn)) {
+            if (dto.flg_print === true) {
+              this.logger.logError(`generatePrintFile - oblpn= ${dto.oblpn} agregado (flg_print=true)`);
+              oblpnList.push(dto.oblpn);
+            } else {
+              this.logger.logError(`generatePrintFile - oblpn= ${dto.oblpn} NO agregado (flg_print=false o undefined)`);
+            }
           }
         }
         this.logger.logError(`generatePrintFile - oblpnList = ${JSON.stringify(oblpnList, null, 2)}`);
@@ -62,7 +73,7 @@ export class PrintFileService {
             const cartones = chunk.join(',');
             this.logger.logError(`generatePrintFile - cartones = ${cartones}`);
 
-            await this.getDataShipping('Etiq_Env_Kisoft_V2', facilityCode, 'BOFASA', cartones, uniqueArray.length);
+            await this.getDataShipping('Etiq_Env_Kisoft_V2', facilityCode, 'BOFASA', cartones, uniqueArray.length, chunk);
           }
         }
       }
@@ -75,27 +86,33 @@ export class PrintFileService {
       try
       {
         this.logger.logError(`validateEstacion152 - oblpn:${dto.oblpn} - ob_lpn_type:${dto.ob_lpn_type}`);
-        if(dto.ob_lpn_type === '06') {          
-          const sumaVolumenLinea = this.getSumaVolumenLinea(data, dto.oblpn);
-          this.logger.logError(`validateEstacion152 - oblpn:${dto.oblpn} - sumaVolumenLinea = ${sumaVolumenLinea}`);
-          //this.logger.logError(`validateEstacion152 - sequenceDetailService = ${JSON.stringify(sequenceDetailService, null, 2)}`);
 
-          if(sumaVolumenLinea > 18000) {
+        // Obtener los tipos configurados desde la tabla de parámetros del sistema
+        const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
+        
+        if(configuredObLpnTypes.includes(dto.ob_lpn_type)) {          
+          const sumaVolumenLinea = this.woaCalculationService.getSumaVolumenLinea(data, dto.oblpn);
+          this.logger.logError(`validateEstacion152 - oblpn:${dto.oblpn} - sumaVolumenLinea = ${sumaVolumenLinea}`);
+
+          const threshold = await this.woaConfigService.getVolumenLineaThreshold();
+          if(sumaVolumenLinea > threshold) {
             const sequenceDetailService = await this.sequenceDetailService.findByObLpnType(dto.ob_lpn_type);
             this.logger.logError(`validateEstacion152 - oblpn:${dto.oblpn} - sequenceDetailService = ${JSON.stringify(sequenceDetailService, null, 2)}`);
             const sequence = await this.sequenceService.findById(sequenceDetailService.sequenceId);
             this.logger.logError(`validateEstacion152 - oblpn:${dto.oblpn} - sequence = ${JSON.stringify(sequence, null, 2)}`);
             return sequence.SEC3 === '152';
           }
+          return false;
         }
-        return false;
+        else
+          return true;
       }
       catch(error) {
         this.logger.logError(`validateEstacion152 - Error al obtener la secuencia, error: ${error.message}`, error.stack);
       }      
     }
 
-    async getDataShipping(label_designer_code: string, facility_id__code: string, company_id__code: string, container_nbr__in: string, data_count: number) {
+    async getDataShipping(label_designer_code: string, facility_id__code: string, company_id__code: string, container_nbr__in: string, data_count: number, requestedOblpns: string[] = []) {
       try
       {
         this.logger.logError(`getDataShipping label_designer_code = ${label_designer_code}`);
@@ -108,11 +125,9 @@ export class PrintFileService {
             Authorization: `Basic ${Buffer.from(`${process.env.API_WMS_USER}:${process.env.API_WMS_PASSWORD}`).toString('base64')}`
           };
 
-        //const url = `${process.env.SHIPPING_URL}?label_designer_code=${label_designer_code}&facility_id__code=${facility_id__code}&company_id__code=${company_id__code}&container_nbr__in=${container_nbr__in}`;
         const url = `${process.env.SHIPPING_URL}?label_designer_code=${encodeURIComponent(label_designer_code)}&facility_id__code=${encodeURIComponent(facility_id__code)}&company_id__code=${encodeURIComponent(company_id__code)}&container_nbr__in=${encodeURIComponent(container_nbr__in)}`;
         this.logger.logError(`URL SHIPPING: ${url}`);
         const response = await this.apiService.requestWithRetriesTime('GET', url, { headers : headers }, data_count > 200);
-        //const response = await this.apiService.request('GET', url, { headers : headers } );        
 
         if(response) {
           this.logger.logError(`getDataShipping response = ${JSON.stringify(response, null, 2)}`);
@@ -120,13 +135,31 @@ export class PrintFileService {
           const data = this.mapResponse(response);
           this.logger.logError(`getDataShipping data = ${JSON.stringify(data, null, 2)}`);
 
+          // Track which OBLPNs were found in the response
+          const foundOblpns = new Set<string>();
           for(const shipping of data){
+            foundOblpns.add(shipping.id);
             await this.savePrintAndUploadFile(shipping.id, shipping.value);
           }
+
+          // Log OBLPNs that were requested but not found in the response
+          if (requestedOblpns && requestedOblpns.length > 0) {
+            const missingOblpns = requestedOblpns.filter(oblpn => !foundOblpns.has(oblpn));
+            if (missingOblpns.length > 0) {
+              this.logger.logError(`getDataShipping - OBLPNs solicitados pero no encontrados en la respuesta de la API: ${JSON.stringify(missingOblpns, null, 2)}`);
+            } else {
+              this.logger.logError(`getDataShipping - Todos los OBLPNs solicitados fueron encontrados en la respuesta de la API`);
+            }
+          }
+        } else {
+          this.logger.logError(`getDataShipping - La respuesta de la API está vacía o es null. OBLPNs solicitados: ${JSON.stringify(requestedOblpns, null, 2)}`);
         }
       }
       catch(error) {
         this.logger.logError(`Error al generar archivo de impresión, error: ${error.message}`, error.stack);
+        if (requestedOblpns && requestedOblpns.length > 0) {
+          this.logger.logError(`getDataShipping - Error al obtener datos para OBLPNs: ${JSON.stringify(requestedOblpns, null, 2)}`);
+        }
       }
     }
 
@@ -158,7 +191,7 @@ export class PrintFileService {
 
         const remotePrintFilePath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileName);
 
-        //await this.sftpService.uploadFile(remotePrintFilePath, filePath);
+        await this.sftpService.uploadFile(remotePrintFilePath, filePath);
 
         const fileNameEnd = `${oblpn}.01.008.000.end`;
         const filePathEnd = path.join(this.printFileDirectory, fileNameEnd);
@@ -168,7 +201,7 @@ export class PrintFileService {
 
         const remotePrintFileEndPath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileNameEnd);
         
-        //await this.sftpService.uploadFile(remotePrintFileEndPath, filePathEnd);
+        await this.sftpService.uploadFile(remotePrintFileEndPath, filePathEnd);
     }
 
     private async createAndAppendFile(filePath: string, content: string): Promise<void> {
@@ -185,13 +218,5 @@ export class PrintFileService {
 
     validateNullString(text: string | undefined) {
       return text === undefined || (typeof text === 'string' && text.replace(/^\s+/, '').length == 0);
-    }
-
-    getSumaVolumenLinea(data: CreateWoaDto[], oblpn: string) {
-      const volumenLineas = data.filter(woa => woa.oblpn === oblpn && woa.volumen_linea != null).map(woa => woa.volumen_linea);
-  
-      return volumenLineas.reduce((acc, item) => {
-        return acc + (item != null && typeof item === 'number' ? item : 0);
-      }, 0);
     }
 }

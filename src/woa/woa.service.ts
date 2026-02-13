@@ -17,6 +17,8 @@ import moment from 'moment';
 import { ArticleService } from 'src/article/article.service';
 import * as csvParse from 'csv-parse/sync';
 import { Article } from 'src/article/entities/article.entity';
+import { WoaCalculationService } from './woa-calculation.service';
+import { WoaConfigService } from './config/woa-config.service';
 
 @Injectable()
 export class WoaService {
@@ -32,7 +34,9 @@ constructor(
   private readonly sequenceDetailService: SequenceDetailService,
   private readonly printFileService: PrintFileService,
   private readonly traceService: TraceService,
-  private readonly articleService: ArticleService
+  private readonly articleService: ArticleService,
+  private readonly woaCalculationService: WoaCalculationService,
+  private readonly woaConfigService: WoaConfigService
 ){}
 
   async iniciarProceso(trama: string) {
@@ -46,20 +50,21 @@ constructor(
     try
     {
       this.logger.logError("Inicio procesamiento de datos recibidos en WOA");
-      const createWoaList = await this.procesarTramaWAO(trama);
-      this.logger.logError("PASO 1");
+      let createWoaList = await this.procesarTramaWAO(trama);
+      
       if(createWoaList && createWoaList.length > 0) {
-        this.logger.logError("PASO 2");
-        //const dataSaved = await this.saveWoa(createWoaList);
-        const dataSaved = await this.calculateVolumenLinea(createWoaList);
-  
+        const dataSaved = await this.saveWoa(createWoaList);
+        
+        // Para pruebas
+        //const dataSaved = await this.calculateVolumenLinea(createWoaList);
+        
         if(dataSaved && dataSaved.length > 0){
           this.logger.logError("Inicio de envío de tramas WOA");
-          //await this.sendToKisoft(dataSaved);
+          const dataProcessed = await this.sendToKisoft(dataSaved);
     
           this.logger.logError("Inicio de generación de archivo de impresión");
-          await this.printFileService.generatePrintFile(dataSaved);
-        } 
+          await this.printFileService.generatePrintFile(dataProcessed || dataSaved);
+        }
       }
     }
     catch(error) {
@@ -120,13 +125,14 @@ constructor(
       for (const dto of data) {
         const articleKey = `${dto.allocated_location}_${dto.part_a}`;
         const article = articlesMap.get(articleKey);
-        
+
         if (article && dto.allocated_qty) {
           dto.volumen_linea = Number(dto.allocated_qty) * Number(article.Volumen_Unidad);
         } else {
           dto.volumen_linea = 0;
         }
-        this.logger.logError(`allocated_location: ${dto.allocated_location} - part_a:${dto.part_a} - volumen_linea: ${JSON.stringify(dto.volumen_linea, null, 2)}`);
+        
+        this.logger.logError(`oblpn:${dto.oblpn} - allocated_location: ${dto.allocated_location} - part_a:${dto.part_a} - allocated_qty:${dto.allocated_qty} - volumen_linea: ${dto.volumen_linea}`);
       }
 
       return data;
@@ -142,14 +148,14 @@ constructor(
 
     for (let i = 0; i < data.length; i += batchSize) {
       const batch = data.slice(i, i + batchSize);
-      const woaInsert = await this.saveWoa3(batch);
+      const woaInsert = await this.saveWoaByChunk(batch);
       woaSaved.push(...woaInsert);
     }
 
     return woaSaved;
   }
 
-  private async saveWoa3(data: CreateWoaDto[]): Promise<CreateWoaDto[]> {
+  private async saveWoaByChunk(data: CreateWoaDto[]): Promise<CreateWoaDto[]> {
     const woaSaved: CreateWoaDto[] = [];
 
     const duplicates = this.findDuplicates(data);
@@ -179,6 +185,7 @@ constructor(
     }
 
     const articles = await this.articleService.findAddByKeys(data);
+
     const articlesMap = new Map<string, Article>();
     for (const article of articles) {
       const key = `${article.Cod_Barra_Ubicacion}_${article.Cod_Alt_Producto}`;
@@ -201,6 +208,9 @@ constructor(
       try{
         if (article && dto.allocated_qty) {
           volumen_linea = Number(dto.allocated_qty) * Number(article.Volumen_Unidad);
+        }
+        else {
+          volumen_linea = 0;
         }
       }
       catch(error) {
@@ -270,7 +280,7 @@ constructor(
     return duplicates;
   }
 
-  private async buildTramaKisoft(createWoaDto: CreateWoaDto, data: CreateWoaDto[]): Promise<string> {
+  private async buildTramaKisoft(createWoaDto: CreateWoaDto, data: CreateWoaDto[], volumenOverLimitOblpns: string[], envioChequeoOblpns: string[]): Promise<string> {
     try
     {
       this.logger.logError("buildTramaKisoft - createWoaDto", JSON.stringify(createWoaDto, null, 2));
@@ -383,10 +393,22 @@ constructor(
               const ob_lpn_type_station_allow: string[] = [ '02', '04', '05', '06', '07', '08', '11' ];
 
               if(ob_lpn_type_station_allow.includes(createWoaDto.ob_lpn_type)) {
-                const sumaVolumenLinea = createWoaDto.ob_lpn_type == '06' ? this.getSumaVolumenLinea(data, createWoaDto.oblpn) : 0;
-                const secuenceTrama = await this.getSeccionesConcatenadas(ob_lpn_type_kisoft, createWoaDto, sequenceDetailService.sequenceId, sumaVolumenLinea > 18000);
+
+                this.logger.logError(`ob_lpn_type=${createWoaDto.ob_lpn_type}`);
+
+                const secuenceTrama = await this.getSeccionesConcatenadas(
+                  ob_lpn_type_kisoft, 
+                  createWoaDto, 
+                  sequenceDetailService.sequenceId,
+                  volumenOverLimitOblpns,
+                  envioChequeoOblpns
+                );                
+                
+                this.logger.logError(`secuenceTrama=${secuenceTrama}`);
+                this.logger.logError(`flg_print=${createWoaDto.flg_print}`);
                 partsTrama.push(secuenceTrama);
               }
+
               break;
             }
             case 'ob_lpn_type_f60': {
@@ -434,15 +456,15 @@ constructor(
     }
   }
 
-  getSumaVolumenLinea(data: CreateWoaDto[], oblpn: string) {
-    const volumenLineas = data.filter(woa => woa.oblpn == oblpn && woa.volumen_linea != null).map(woa => woa.volumen_linea);
-    return volumenLineas.reduce((acc, value) => acc + (typeof value === 'number' ? value : 0), 0);
-  }
 
-  async getSeccionesConcatenadas(oblpnTypeKisoft: string, woa: CreateWoaDto, sequenceId: number, flgVolumenLinea: boolean) : Promise<string> {
+  async getSeccionesConcatenadas(oblpnTypeKisoft: string, woa: CreateWoaDto, sequenceId: number, volumenOverLimitOblpns: string[], envioChequeoOblpns: string[]) : Promise<string> {
     const sequenceTrama: string[] = [];
     const sequence = await this.sequenceService.findById(sequenceId);
-    let cantSections = 0;
+
+    // Inicializar flg_print como false
+    woa.flg_print = false;
+
+    this.logger.logError(`oblpn:${woa.oblpn} - getSeccionesConcatenadas - sequence = ${JSON.stringify(sequence, null, 2)}`);
 
     if(sequence) {
       const sec0 = sequence.SEC0 ? sequence.SEC0.replace(/\s+/g, '') : '';
@@ -452,40 +474,85 @@ constructor(
       let sec4 = sequence.SEC4 ? sequence.SEC4.replace(/\s+/g, '') : '';
       const sec5 = sequence.SEC5 ? sequence.SEC5.replace(/\s+/g, '') : '';
 
-      if(woa.ob_lpn_type == '06') {
-        if(flgVolumenLinea && Number(woa.oblpn) % 2 == 0) {
-          sec1 = '';
-        }
+      // Obtener los tipos configurados
+      const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
+      const isConfiguredType = configuredObLpnTypes.includes(woa.ob_lpn_type);
+      const isVolumenOverLimit = volumenOverLimitOblpns.includes(woa.oblpn);
 
-        if(!flgVolumenLinea) {
+      // Verificar customer exception para tipo '02' antes de aplicar lógica general
+      let isCustomerException = false;
+      if(woa.cust_nbr != '' && woa.ob_lpn_type === '02') {
+        isCustomerException = await this.woaConfigService.isCustomerExceptionConfigured(woa.cust_nbr);
+        this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - ob_lpn_type = 02 - cust_nbr: ${woa.cust_nbr} - isCustomerException: ${isCustomerException} - isVolumenOverLimit: ${isVolumenOverLimit}`);
+      }
+
+      if(woa.ob_lpn_type === '02') {
+        // Para tipo '02': Solo mantener SEC3 y SEC4 si tiene customer exception Y supera volumen
+        // En todos los demás casos, vaciar SEC3 y SEC4
+        if (!isVolumenOverLimit || !isCustomerException) {
           sec3 = '';
           sec4 = '';
+          this.logger.logError(`sec3 y 4 se puso en vacio (tipo 02), isCustomerException:${isCustomerException} - isVolumenOverLimit:${isVolumenOverLimit}`);
+        } else {
+          this.logger.logError(`sec3 y 4 se mantienen (tipo 02 + customer exception + volumen over limit), isCustomerException:${isCustomerException} - isVolumenOverLimit:${isVolumenOverLimit}`);
+        }
+      }
+
+      if(isConfiguredType) {
+        // Verificar si el OBLPN está en volumenOverLimitOblpns y NO está en envioChequeoOblpn        
+        const isEnvioChequeo = envioChequeoOblpns.includes(woa.oblpn);
+        
+        if (isVolumenOverLimit && !isEnvioChequeo) {
+          sec1 = '';
+          this.logger.logError(`sec1 se puso en vacio, isEnvioChequeo:${isEnvioChequeo} - isVolumenOverLimit:${isVolumenOverLimit}`);
+        }
+
+        // Lógica para SEC3 y SEC4 para otros tipos configurados (no tipo '02'):
+        // - Si !isVolumenOverLimit: vaciar SEC3 y SEC4
+        // - Si isVolumenOverLimit = true: mantener SEC3 y SEC4 (comportamiento original)
+        if (woa.ob_lpn_type !== '02') {
+          if (!isVolumenOverLimit) {
+            // Si no supera volumen, vaciar SEC3 y SEC4 (comportamiento normal para tipos configurados)
+            sec3 = '';
+            sec4 = '';
+            this.logger.logError(`sec3 y 4 se puso en vacio, isVolumenOverLimit:${isVolumenOverLimit}`);
+          }
+          // Si isVolumenOverLimit = true: SEC3 y SEC4 se mantienen (comportamiento por defecto)
         }
       }
 
       if(sec0 != '') {
         sequenceTrama.push(this.textService.padText(sec0, 3, '0'));
-        cantSections++;
       }
 
       if(sec1 != '') {
         sequenceTrama.push(this.textService.padText(sec1, 3, '0'))
-        cantSections++;
       }
 
       if(sec2 != '') {
         sequenceTrama.push(this.textService.padText(sec2, 3, '0'));
-        cantSections++;
       }
+
+      // Rastrear si SEC3 y SEC4 fueron agregados
+      let sec3Added = false;
+      let sec4Added = false;
 
       if(sec3 != '') {
         sequenceTrama.push(this.textService.padText(sec3, 3, '0'));
-        cantSections++;
+        sec3Added = true;
       }
 
       if(sec4 != '') {
         sequenceTrama.push(this.textService.padText(sec4, 3, '0'));
-        cantSections++;
+        sec4Added = true;
+      }
+
+      // Setear flg_print solo si AMBOS SEC3 y SEC4 fueron agregados
+      if (sec3Added && sec4Added) {
+        woa.flg_print = true;
+        this.logger.logError(`oblpn:${woa.oblpn} - getSeccionesConcatenadas - ob_lpn_type:${woa.ob_lpn_type} - flg_print = true (SEC3 y SEC4 concatenados)`);
+      } else {
+        this.logger.logError(`oblpn:${woa.oblpn} - getSeccionesConcatenadas - ob_lpn_type:${woa.ob_lpn_type} - flg_print = false (SEC3 agregado: ${sec3Added}, SEC4 agregado: ${sec4Added})`);
       }
 
       if(sec5 != '') {
@@ -506,13 +573,19 @@ constructor(
 
           sequenceTrama.push(sec5Value);
         }
-
-        cantSections++;
       }
 
-      sequenceTrama.unshift(`K${this.textService.padText(sequenceTrama.length.toString(), 2, '0')}03`);
-      return sequenceTrama.join('');
+      if(sequenceTrama.length > 0) {
+        this.logger.logError(`oblpn:${woa.oblpn} - getSeccionesConcatenadas - sequenceTrama = ${JSON.stringify(sequenceTrama, null, 2)}`);
+
+        sequenceTrama.unshift(`K${this.textService.padText(sequenceTrama.length.toString(), 2, '0')}03`);
+
+        this.logger.logError(`oblpn:${woa.oblpn} - getSeccionesConcatenadas - sequenceTrama = ${JSON.stringify(sequenceTrama, null, 2)}`);
+        return sequenceTrama.join('');
+      }
     }
+    
+    return '';
   }
 
   private buildTramaDetalleKisoft(data: CreateWoaDto[], oblpn: string): string {
@@ -525,7 +598,7 @@ constructor(
       if(dataSearch != undefined) {  
         dataSearch.forEach(dto => {
           
-          if(dto.allocated_location.trimStart().substring(0, 4) == ('AE10')) {
+          if(dto.allocated_location && dto.allocated_location.trimStart().substring(0, 4) == ('AE10')) {
             partsTrama.push(this.textService.padText('061', 3));
           }
           else {
@@ -545,17 +618,100 @@ constructor(
     }
   }
 
-  private async sendToKisoft(data: CreateWoaDto[]){
+  /**
+   * Calcula volumenOverLimit y envioChequeo para objetos con ob_lpn_type configurados
+   * @param dataProcessed Array de objetos procesados sin duplicados
+   * @param data Array completo de datos originales
+   * @returns Objeto con dos arreglos: volumenOverLimitOblpns y envioChequeoOblpns
+   */
+  private async calculateVolumenOverLimitAndEnvioChequeo(
+    dataProcessed: CreateWoaDto[],
+    data: CreateWoaDto[]
+  ): Promise<{ volumenOverLimitOblpns: string[], envioChequeoOblpns: string[] }> {
+    const volumenOverLimitOblpns: string[] = [];
+    const envioChequeoOblpns: string[] = [];
+
+    // Obtener los tipos de ob_lpn_type configurados desde la tabla de parámetros del sistema
+    const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
+    
+    // Buscar un objeto con alguno de los tipos configurados
+    const dtoWithConfiguredType = dataProcessed.find(dto => 
+      configuredObLpnTypes.includes(dto.ob_lpn_type)
+    );
+    
+    if (!dtoWithConfiguredType) {
+      return { volumenOverLimitOblpns, envioChequeoOblpns };
+    }
+
+    const obLpnType = dtoWithConfiguredType.ob_lpn_type;
+    
+    // Obtener la secuencia para el ob_lpn_type encontrado y su percentage
+    const sequenceDetail = await this.sequenceDetailService.findByObLpnType(obLpnType);
+    const sequence = sequenceDetail 
+      ? await this.sequenceService.findById(sequenceDetail.sequenceId)
+      : null;
+    const percentage = sequence?.percentage ?? 100;
+
+    // Usar un Set para evitar calcular volumenOverLimit duplicado para el mismo oblpn
+    const processedOblpns = new Set<string>();
+
+    // Obtener el umbral desde la tabla de parámetros del sistema
+    const threshold = await this.woaConfigService.getVolumenLineaThreshold();
+
+    // Calcular volumenOverLimit para cada oblpn único (solo para tipos configurados)
+    for (const dto of dataProcessed) {
+      if (configuredObLpnTypes.includes(dto.ob_lpn_type) && dto.oblpn) {
+        if (!processedOblpns.has(dto.oblpn)) {
+          // Sumar volumen_linea desde data completo (puede tener múltiples objetos con el mismo oblpn)
+          const volumenLinea = this.woaCalculationService.getSumaVolumenLinea(data, dto.oblpn);
+          const volumenOverLimit = volumenLinea > threshold;
+          
+          this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - oblpn: ${dto.oblpn} - volumenLinea sumado desde data completo: ${volumenLinea} - threshold: ${threshold} - volumenOverLimit: ${volumenOverLimit}`);
+          
+          // Agregar OBLPN al arreglo si supera la volumetría
+          if (volumenOverLimit && !volumenOverLimitOblpns.includes(dto.oblpn)) {
+            volumenOverLimitOblpns.push(dto.oblpn);
+          }
+          
+          processedOblpns.add(dto.oblpn);
+        }
+      }
+    }
+
+    // Marcar aleatoriamente el porcentaje de los OBLPNs que superaron el límite de volumen para envioChequeo
+    // Solo considerar los OBLPNs que están en volumenOverLimitOblpns
+    const totalObjectsVolumenOverLimit = volumenOverLimitOblpns.length;
+    this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - Total de oblpn que superan el límite de volumen = ${totalObjectsVolumenOverLimit}`);
+    const countToMark = Math.floor((totalObjectsVolumenOverLimit * percentage) / 100);
+    this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - Total de oblpns que se marcarán para enviar a chequeo = ${countToMark}`);
+    
+    // Mezclar aleatoriamente solo los OBLPNs que superaron el límite y agregar los primeros N al arreglo
+    const shuffled = [...volumenOverLimitOblpns].sort(() => Math.random() - 0.5);
+    for (let i = 0; i < countToMark && i < shuffled.length; i++) {
+      if (shuffled[i] && !envioChequeoOblpns.includes(shuffled[i])) {
+        envioChequeoOblpns.push(shuffled[i]);
+        this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - oblpn: ${shuffled[i]} - agregado a envioChequeoOblpns (del grupo que superó el límite de volumen)`);
+      }
+    }
+
+    return { volumenOverLimitOblpns, envioChequeoOblpns };
+  }
+
+  private async sendToKisoft(data: CreateWoaDto[]): Promise<CreateWoaDto[] | undefined> {
     try
     {
       if(data) {
         const dataProcessed = this.removeDuplicates(data);
 
+        // Calcular volumenOverLimit y envioChequeo para los ob_lpn_type configurados
+        const { volumenOverLimitOblpns, envioChequeoOblpns } = 
+          await this.calculateVolumenOverLimitAndEnvioChequeo(dataProcessed, data);        
+
         for(const dto of dataProcessed) {
           try {
             //Se construye trama y se envía a puerto Kisoft
             this.logger.logError(`dto: ${JSON.stringify(dto, null, 2)}`);
-            const tramaKisoft = await this.buildTramaKisoft(dto, data);
+            const tramaKisoft = await this.buildTramaKisoft(dto, data, volumenOverLimitOblpns, envioChequeoOblpns);
             let trama = '';
 
             if(dto.action_code == "CREATE"){
@@ -589,10 +745,13 @@ constructor(
         };
 
         this.logger.logError(`Finalizó envio de trama`);
+        return dataProcessed;
       }
+      return undefined;
     }
     catch(error) {
       this.logger.logError(`Error al enviar trama kisoft, error: ${error.message}`, error.stack);
+      return undefined;
     }
   }
 
