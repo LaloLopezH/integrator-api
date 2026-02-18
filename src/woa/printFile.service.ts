@@ -137,10 +137,45 @@ export class PrintFileService {
 
           // Track which OBLPNs were found in the response
           const foundOblpns = new Set<string>();
+          let successCount = 0;
+          let failureCount = 0;
+          const failedOblpns: Array<{ oblpn: string; error: string }> = [];
+
+          this.logger.logError(`getDataShipping - Iniciando procesamiento de ${data.length} OBLPN(s)`);
+
           for(const shipping of data){
             foundOblpns.add(shipping.id);
-            await this.savePrintAndUploadFile(shipping.id, shipping.value);
+            this.logger.logError(`getDataShipping - [OBLPN: ${shipping.id}] Iniciando procesamiento`);
+            
+            try {
+              await this.savePrintAndUploadFile(shipping.id, shipping.value);
+              successCount++;
+              this.logger.logError(`getDataShipping - [OBLPN: ${shipping.id}] Procesamiento completado exitosamente`);
+            } catch (error) {
+              failureCount++;
+              const errorMessage = error.message || 'Error desconocido';
+              failedOblpns.push({ oblpn: shipping.id, error: errorMessage });
+              this.logger.logError(`getDataShipping - [OBLPN: ${shipping.id}] Error durante el procesamiento: ${errorMessage}`, error.stack);
+            }
           }
+
+          // Resumen final con estadísticas de procesamiento
+          const totalProcessed = successCount + failureCount;
+          this.logger.logError(`getDataShipping - ========== RESUMEN DE PROCESAMIENTO ==========`);
+          this.logger.logError(`getDataShipping - Total de OBLPNs procesados: ${totalProcessed}`);
+          this.logger.logError(`getDataShipping - OBLPNs procesados exitosamente: ${successCount}`);
+          this.logger.logError(`getDataShipping - OBLPNs con errores: ${failureCount}`);
+          
+          if (failedOblpns.length > 0) {
+            this.logger.logError(`getDataShipping - OBLPNs con errores (detalle): ${JSON.stringify(failedOblpns, null, 2)}`);
+          }
+          
+          if (successCount === totalProcessed && totalProcessed > 0) {
+            this.logger.logError(`getDataShipping - Todos los OBLPNs fueron procesados exitosamente`);
+          } else if (failureCount > 0) {
+            this.logger.logError(`getDataShipping - ADVERTENCIA: ${failureCount} OBLPN(s) fallaron durante el procesamiento`);
+          }
+          this.logger.logError(`getDataShipping - ===============================================`);
 
           // Log OBLPNs that were requested but not found in the response
           if (requestedOblpns && requestedOblpns.length > 0) {
@@ -176,38 +211,75 @@ export class PrintFileService {
     }
 
     async savePrintAndUploadFile(oblpn_nbr: string, data: string): Promise<void> {
-        if (!fs.existsSync(this.printFileDirectory)) {
-            fs.mkdirSync(this.printFileDirectory, { recursive: true });
+        try {
+            if (!fs.existsSync(this.printFileDirectory)) {
+                fs.mkdirSync(this.printFileDirectory, { recursive: true });
+            }
+            this.logger.logError(`savePrintAndUploadFile - Iniciando procesamiento para OBLPN: ${oblpn_nbr}`);
+
+            const oblpn = this.textService.padText(oblpn_nbr, 10, '0');
+            
+            const fileName = `${oblpn}.01.008.000.01`;
+            const filePath = path.join(this.printFileDirectory, fileName);
+            this.logger.logError(`savePrintAndUploadFile - filePath = ${filePath}`);
+
+            // Creación de archivo principal
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando creación de archivo principal: ${fileName}`);
+            try {
+                await this.createAndAppendFile(filePath, data);
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Archivo principal creado exitosamente: ${fileName}`);
+            } catch (error) {
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Error al crear archivo principal ${fileName}: ${error.message}`, error.stack);
+                throw error;
+            }
+
+            // Upload SFTP del archivo principal
+            const remotePrintFilePath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileName);
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando upload SFTP del archivo principal: ${remotePrintFilePath}`);
+            try {
+                await this.sftpService.uploadFile(remotePrintFilePath, filePath);
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Upload SFTP del archivo principal completado exitosamente: ${remotePrintFilePath}`);
+            } catch (error) {
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Error al subir archivo principal al SFTP ${remotePrintFilePath}: ${error.message}`, error.stack);
+                throw error;
+            }
+
+            // Creación de archivo .end
+            const fileNameEnd = `${oblpn}.01.008.000.end`;
+            const filePathEnd = path.join(this.printFileDirectory, fileNameEnd);
+            this.logger.logError(`savePrintAndUploadFile - filePathEnd = ${filePathEnd}`);
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando creación de archivo .end: ${fileNameEnd}`);
+            try {
+                await this.createAndAppendFile(filePathEnd, '');
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Archivo .end creado exitosamente: ${fileNameEnd}`);
+            } catch (error) {
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Error al crear archivo .end ${fileNameEnd}: ${error.message}`, error.stack);
+                throw error;
+            }
+
+            // Upload SFTP del archivo .end
+            const remotePrintFileEndPath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileNameEnd);
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando upload SFTP del archivo .end: ${remotePrintFileEndPath}`);
+            try {
+                await this.sftpService.uploadFile(remotePrintFileEndPath, filePathEnd);
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Upload SFTP del archivo .end completado exitosamente: ${remotePrintFileEndPath}`);
+            } catch (error) {
+                this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Error al subir archivo .end al SFTP ${remotePrintFileEndPath}: ${error.message}`, error.stack);
+                throw error;
+            }
+
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Procesamiento completado exitosamente`);
+        } catch (error) {
+            this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Error crítico durante el procesamiento: ${error.message}`, error.stack);
+            throw error;
         }
-        this.logger.logError(`savePrintAndUploadFile - oblpn_nbr = ${oblpn_nbr}`);
-
-        const oblpn = this.textService.padText(oblpn_nbr, 10, '0');
-        
-        const fileName = `${oblpn}.01.008.000.01`;
-        const filePath = path.join(this.printFileDirectory, fileName);
-        this.logger.logError(`savePrintAndUploadFile - filePath = ${filePath}`);
-
-        await this.createAndAppendFile(filePath, data);
-
-        const remotePrintFilePath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileName);
-
-        await this.sftpService.uploadFile(remotePrintFilePath, filePath);
-
-        const fileNameEnd = `${oblpn}.01.008.000.end`;
-        const filePathEnd = path.join(this.printFileDirectory, fileNameEnd);
-        this.logger.logError(`savePrintAndUploadFile - filePathEnd = ${filePathEnd}`);
-
-        await this.createAndAppendFile(filePathEnd, '');
-
-        const remotePrintFileEndPath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileNameEnd);
-        
-        await this.sftpService.uploadFile(remotePrintFileEndPath, filePathEnd);
     }
 
     private async createAndAppendFile(filePath: string, content: string): Promise<void> {
         return new Promise((resolve, reject) => {
           fs.appendFile(filePath, content, { encoding: 'utf8' }, (err) => {
             if (err) {
+              this.logger.logError(`createAndAppendFile - Error al crear o agregar contenido al archivo. FilePath: ${filePath}, Error: ${err.message}`, err.stack);
               reject(`Error creando o agregando contenido al archivo: ${err.message}`);
             } else {
               resolve();

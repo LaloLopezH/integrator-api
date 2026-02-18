@@ -116,23 +116,38 @@ constructor(
     try {
       const articles = await this.articleService.findAddByKeys(data);
       
+      this.logger.logError(`calculateVolumenLinea - Total de artículos encontrados en BD: ${articles.length}`);
+      
       const articlesMap = new Map<string, Article>();
       for (const article of articles) {
-        const key = `${article.Cod_Barra_Ubicacion}_${article.Cod_Alt_Producto}`;
+        // Normalizar valores para evitar problemas con espacios en blanco
+        const ubicacion = article.Cod_Barra_Ubicacion?.trim() || '';
+        const producto = article.Cod_Alt_Producto?.trim() || '';
+        const key = `${ubicacion}_${producto}`;
         articlesMap.set(key, article);
+        this.logger.logError(`calculateVolumenLinea - Artículo cargado en mapa - Key: ${key}, Cod_Barra_Ubicacion: "${ubicacion}", Cod_Alt_Producto: "${producto}", Volumen_Unidad: ${article.Volumen_Unidad}`);
       }
 
       for (const dto of data) {
-        const articleKey = `${dto.allocated_location}_${dto.part_a}`;
+        // Normalizar valores para que coincidan con las claves del mapa
+        const ubicacion = dto.allocated_location?.trim() || '';
+        const producto = dto.part_a?.trim() || '';
+        const articleKey = `${ubicacion}_${producto}`;
         const article = articlesMap.get(articleKey);
 
         if (article && dto.allocated_qty) {
           dto.volumen_linea = Number(dto.allocated_qty) * Number(article.Volumen_Unidad);
+          this.logger.logError(`calculateVolumenLinea - oblpn:${dto.oblpn} - allocated_location: "${ubicacion}" - part_a:"${producto}" - allocated_qty:${dto.allocated_qty} - Volumen_Unidad: ${article.Volumen_Unidad} - volumen_linea: ${dto.volumen_linea}`);
         } else {
           dto.volumen_linea = 0;
+          if (!article) {
+            this.logger.logError(`calculateVolumenLinea - Artículo NO encontrado para oblpn:${dto.oblpn} - Key buscada: "${articleKey}" - allocated_location: "${ubicacion}" - part_a:"${producto}"`);
+            this.logger.logError(`calculateVolumenLinea - Claves disponibles en el mapa (primeras 10): ${Array.from(articlesMap.keys()).slice(0, 10).join(', ')}${articlesMap.size > 10 ? ' ...' : ''}`);
+          } else if (!dto.allocated_qty) {
+            this.logger.logError(`calculateVolumenLinea - allocated_qty es null/undefined para oblpn:${dto.oblpn} - allocated_location: "${ubicacion}" - part_a:"${producto}"`);
+          }
+          this.logger.logError(`calculateVolumenLinea - oblpn:${dto.oblpn} - allocated_location: "${ubicacion}" - part_a:"${producto}" - allocated_qty:${dto.allocated_qty} - volumen_linea: ${dto.volumen_linea}`);
         }
-        
-        this.logger.logError(`oblpn:${dto.oblpn} - allocated_location: ${dto.allocated_location} - part_a:${dto.part_a} - allocated_qty:${dto.allocated_qty} - volumen_linea: ${dto.volumen_linea}`);
       }
 
       return data;
@@ -634,9 +649,9 @@ constructor(
     // Obtener los tipos de ob_lpn_type configurados desde la tabla de parámetros del sistema
     const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
     
-    // Buscar un objeto con alguno de los tipos configurados
+    // Buscar un objeto con alguno de los tipos configurados (incluyendo '02' para obtener la secuencia)
     const dtoWithConfiguredType = dataProcessed.find(dto => 
-      configuredObLpnTypes.includes(dto.ob_lpn_type)
+      configuredObLpnTypes.includes(dto.ob_lpn_type) || dto.ob_lpn_type === '02'
     );
     
     if (!dtoWithConfiguredType) {
@@ -658,9 +673,9 @@ constructor(
     // Obtener el umbral desde la tabla de parámetros del sistema
     const threshold = await this.woaConfigService.getVolumenLineaThreshold();
 
-    // Calcular volumenOverLimit para cada oblpn único (solo para tipos configurados)
+    // Calcular volumenOverLimit solo para ob_lpn_type '02' en este método
     for (const dto of dataProcessed) {
-      if (configuredObLpnTypes.includes(dto.ob_lpn_type) && dto.oblpn) {
+      if (dto.ob_lpn_type === '02' && dto.oblpn) {
         if (!processedOblpns.has(dto.oblpn)) {
           // Sumar volumen_linea desde data completo (puede tener múltiples objetos con el mismo oblpn)
           const volumenLinea = this.woaCalculationService.getSumaVolumenLinea(data, dto.oblpn);

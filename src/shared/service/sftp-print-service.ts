@@ -74,8 +74,7 @@ export class SftpPrintService implements OnModuleInit, OnModuleDestroy {
         return 'Archivo subido exitosamente al SFTP Print.';
       } catch (error) {
         attempt++;
-        this.logger.logError(`
-           (intento ${attempt}): ${error.message}`, error.stack);
+        this.logger.logError(`Error al subir archivo al SFTP (intento ${attempt}/${maxRetries}): ${localPath} -> ${remotePath}. Error: ${error.message}`, error.stack);
 
         if (attempt >= maxRetries) {
           throw new Error(`Fallo permanente al subir el archivo al SFTP después de ${maxRetries} intentos`);
