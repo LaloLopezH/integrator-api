@@ -649,9 +649,18 @@ constructor(
     // Obtener los tipos de ob_lpn_type configurados desde la tabla de parámetros del sistema
     const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
     
-    // Buscar un objeto con alguno de los tipos configurados (incluyendo '02' para obtener la secuencia)
+    // Crear array con los tipos configurados más el tipo '02' (si no está ya incluido)
+    const tiposParaCalcular = [...configuredObLpnTypes];
+    if (!tiposParaCalcular.includes('02')) {
+      tiposParaCalcular.push('02');
+    }
+    
+    this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - Tipos configurados: ${JSON.stringify(configuredObLpnTypes)}`);
+    this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - Tipos para calcular volumen: ${JSON.stringify(tiposParaCalcular)}`);
+    
+    // Buscar un objeto con alguno de los tipos que se van a calcular
     const dtoWithConfiguredType = dataProcessed.find(dto => 
-      configuredObLpnTypes.includes(dto.ob_lpn_type) || dto.ob_lpn_type === '02'
+      tiposParaCalcular.includes(dto.ob_lpn_type)
     );
     
     if (!dtoWithConfiguredType) {
@@ -673,15 +682,15 @@ constructor(
     // Obtener el umbral desde la tabla de parámetros del sistema
     const threshold = await this.woaConfigService.getVolumenLineaThreshold();
 
-    // Calcular volumenOverLimit solo para ob_lpn_type '02' en este método
+    // Calcular volumenOverLimit para ob_lpn_types configurados y tipo '02'
     for (const dto of dataProcessed) {
-      if (dto.ob_lpn_type === '02' && dto.oblpn) {
+      if (tiposParaCalcular.includes(dto.ob_lpn_type) && dto.oblpn) {
         if (!processedOblpns.has(dto.oblpn)) {
           // Sumar volumen_linea desde data completo (puede tener múltiples objetos con el mismo oblpn)
           const volumenLinea = this.woaCalculationService.getSumaVolumenLinea(data, dto.oblpn);
           const volumenOverLimit = volumenLinea > threshold;
           
-          this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - oblpn: ${dto.oblpn} - volumenLinea sumado desde data completo: ${volumenLinea} - threshold: ${threshold} - volumenOverLimit: ${volumenOverLimit}`);
+          this.logger.logError(`calculateVolumenOverLimitAndEnvioChequeo - oblpn: ${dto.oblpn} - ob_lpn_type: ${dto.ob_lpn_type} - volumenLinea sumado desde data completo: ${volumenLinea} - threshold: ${threshold} - volumenOverLimit: ${volumenOverLimit}`);
           
           // Agregar OBLPN al arreglo si supera la volumetría
           if (volumenOverLimit && !volumenOverLimitOblpns.includes(dto.oblpn)) {
