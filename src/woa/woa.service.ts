@@ -491,27 +491,42 @@ constructor(
 
       // Obtener los tipos configurados
       const configuredObLpnTypes = await this.woaConfigService.getObLpnTypes();
+      const obLpnTypeStr = String(woa.ob_lpn_type || '').trim();
       const isConfiguredType = configuredObLpnTypes.includes(woa.ob_lpn_type);
       const isVolumenOverLimit = volumenOverLimitOblpns.includes(woa.oblpn);
 
       // Verificar customer exception para tipo '02' antes de aplicar lógica general
       let isCustomerException = false;
-      if(woa.cust_nbr != '' && woa.ob_lpn_type === '02') {
+      if(woa.cust_nbr != '' && obLpnTypeStr === '02') {
         isCustomerException = await this.woaConfigService.isCustomerExceptionConfigured(woa.cust_nbr);
         this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - ob_lpn_type = 02 - cust_nbr: ${woa.cust_nbr} - isCustomerException: ${isCustomerException} - isVolumenOverLimit: ${isVolumenOverLimit}`);
       }
 
-      if(woa.ob_lpn_type === '02') {
+      // Lógica específica para ob_lpn_type '02': SEC3 y SEC4 solo se mantienen si AMBOS isVolumenOverLimit = true Y isCustomerException = true
+      if(obLpnTypeStr === '02') {
+        this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - ENTRANDO a bloque tipo 02 - ob_lpn_type: "${woa.ob_lpn_type}" (tipo: ${typeof woa.ob_lpn_type})`);
+        this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - Evaluando tipo 02 - isVolumenOverLimit: ${isVolumenOverLimit}, isCustomerException: ${isCustomerException}`);
+        this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - Valores iniciales - sec3: "${sec3}", sec4: "${sec4}"`);
+        
         // Para tipo '02': Solo mantener SEC3 y SEC4 si tiene customer exception Y supera volumen
         // En todos los demás casos, vaciar SEC3 y SEC4
-        if (!isVolumenOverLimit || !isCustomerException) {
-          sec3 = '';
-          sec4 = '';
-          this.logger.logError(`sec3 y 4 se puso en vacio (tipo 02), isCustomerException:${isCustomerException} - isVolumenOverLimit:${isVolumenOverLimit}`);
+        const shouldEmptySec3Sec4 = !isVolumenOverLimit || !isCustomerException;
+        this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - Evaluando condición: (!isVolumenOverLimit || !isCustomerException) = (!${isVolumenOverLimit} || !${isCustomerException}) = (${!isVolumenOverLimit} || ${!isCustomerException}) = ${shouldEmptySec3Sec4}`);
+        
+        if (shouldEmptySec3Sec4) {
+            sec3 = '';
+            sec4 = '';
+            this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - SEC3 y SEC4 VACIADOS (tipo 02)`);
+            this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - Valores después de vaciar - sec3: "${sec3}", sec4: "${sec4}"`);
+          } else {
+            this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - SEC3 y SEC4 MANTENIDOS (tipo 02 + customer exception + volumen over limit)`);
+          }
         } else {
-          this.logger.logError(`sec3 y 4 se mantienen (tipo 02 + customer exception + volumen over limit), isCustomerException:${isCustomerException} - isVolumenOverLimit:${isVolumenOverLimit}`);
+          // Log para debugging: confirmar que no es tipo '02'
+          if(woa.ob_lpn_type) {
+            this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - NO es tipo 02 - ob_lpn_type: "${woa.ob_lpn_type}" (tipo: ${typeof woa.ob_lpn_type}, trimmed: "${obLpnTypeStr}")`);
+          }
         }
-      }
 
       if(isConfiguredType) {
         // Verificar si el OBLPN está en volumenOverLimitOblpns y NO está en envioChequeoOblpn        
@@ -525,12 +540,12 @@ constructor(
         // Lógica para SEC3 y SEC4 para otros tipos configurados (no tipo '02'):
         // - Si !isVolumenOverLimit: vaciar SEC3 y SEC4
         // - Si isVolumenOverLimit = true: mantener SEC3 y SEC4 (comportamiento original)
-        if (woa.ob_lpn_type !== '02') {
+        if (obLpnTypeStr !== '02') {
           if (!isVolumenOverLimit) {
             // Si no supera volumen, vaciar SEC3 y SEC4 (comportamiento normal para tipos configurados)
             sec3 = '';
             sec4 = '';
-            this.logger.logError(`sec3 y 4 se puso en vacio, isVolumenOverLimit:${isVolumenOverLimit}`);
+            this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - sec3 y 4 se puso en vacio (otros tipos configurados), isVolumenOverLimit:${isVolumenOverLimit}`);
           }
           // Si isVolumenOverLimit = true: SEC3 y SEC4 se mantienen (comportamiento por defecto)
         }
@@ -551,6 +566,8 @@ constructor(
       // Rastrear si SEC3 y SEC4 fueron agregados
       let sec3Added = false;
       let sec4Added = false;
+
+      this.logger.logError(`getSeccionesConcatenadas - oblpn: ${woa.oblpn} - ANTES de agregar a trama - sec3: "${sec3}", sec4: "${sec4}", ob_lpn_type: "${woa.ob_lpn_type}"`);
 
       if(sec3 != '') {
         sequenceTrama.push(this.textService.padText(sec3, 3, '0'));
