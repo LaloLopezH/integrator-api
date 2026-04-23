@@ -463,12 +463,49 @@ export class ArticleService {
       });
   }
 
+  /**
+   * Busca artículos por las combinaciones (allocated_location, part_a) del data.
+   * Cuando hay múltiples registros para la misma combinación, retorna el de mayor id (último insertado).
+   * @param data Array con allocated_location y part_a
+   * @returns Artículos encontrados, uno por combinación con el id más reciente
+   */
   async findAddByKeys(data: any) {
-    return await this.articleRepository.find({
-      where: data.map(dto => ({
-        Cod_Barra_Ubicacion: dto.allocated_location,
-        Cod_Alt_Producto: dto.part_a
-      })),
+    const uniqueConditions = new Map<string, { ubicacion: string; producto: string }>();
+    for (const dto of data) {
+      const ubicacion = dto.allocated_location?.trim() || '';
+      const producto = dto.part_a?.trim() || '';
+      if (ubicacion && producto) {
+        const key = `${ubicacion}_${producto}`;
+        if (!uniqueConditions.has(key)) {
+          uniqueConditions.set(key, { ubicacion, producto });
+        }
+      }
+    }
+    const conditionsArray = Array.from(uniqueConditions.values());
+    if (conditionsArray.length === 0) return [];
+
+    const qb = this.articleRepository.createQueryBuilder('article');
+    const orConditions = conditionsArray
+      .map((_, i) => `(article."Cod_Barra_Ubicacion" = :ubicacion${i} AND article."Cod_Alt_Producto" = :producto${i})`)
+      .join(' OR ');
+    const params: Record<string, string> = {};
+    conditionsArray.forEach((c, i) => {
+      params[`ubicacion${i}`] = c.ubicacion;
+      params[`producto${i}`] = c.producto;
     });
+
+    qb.where(orConditions, params);
+
+    const all = await qb.getMany();
+    // Quedarse con el de mayor id por cada (Cod_Barra_Ubicacion, Cod_Alt_Producto)
+    const byKey = new Map<string, (typeof all)[0]>();
+    for (const a of all) {
+      const key = `${(a.Cod_Barra_Ubicacion || '').trim()}_${(a.Cod_Alt_Producto || '').trim()}`;
+      const existing = byKey.get(key);
+      if (!existing || (a.id != null && (existing.id == null || Number(a.id) > Number(existing.id)))) {
+        byKey.set(key, a);
+      }
+    }
+    return Array.from(byKey.values());
   }
 }
