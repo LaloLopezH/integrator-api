@@ -97,7 +97,10 @@ export class ProcessReturnService {
                 await this.traceService.update(traceId, JSON.stringify(xmlReturnObject, null, 2));
         
                 const response = await this.xmlService.sendSoapRequest(xmlReturnObject, process.env.PICK_CONFIRM_URL, traceId);
-                this.logger.logError('SOAP response', JSON.stringify(response));
+                this.logger.logError('WLMS SOAP response', JSON.stringify(response));
+
+                const tradIdReceived = await this.traceService.createReceived("PICK_CONFIRM", JSON.stringify(response), null);
+                this.logger.logError('WLMS response, tradIdReceived = ', tradIdReceived.toString());
             }
         }
         else {

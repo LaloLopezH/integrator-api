@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { HttpException, Injectable } from "@nestjs/common";
 import { ApiService } from '../shared/service/api.service';
 import { CreateWoaDto } from './dto/create-woa.dto';
 import { ResponseDataShippingDto } from "./dto/response-data-shipping.dto";
@@ -11,6 +11,7 @@ import { SequenceService } from "./secuence.service";
 import { SequenceDetailService } from "./secuence-detail.service";
 import { WoaCalculationService } from "./woa-calculation.service";
 import { WoaConfigService } from "./config/woa-config.service";
+import { TraceService } from "src/trace/trace.service";
 
 
 @Injectable()
@@ -25,6 +26,7 @@ export class PrintFileService {
                 private readonly sequenceDetailService: SequenceDetailService,
                 private readonly woaCalculationService: WoaCalculationService,
                 private readonly woaConfigService: WoaConfigService,
+                private readonly traceService: TraceService,
     ){}
     
     async generatePrintFile(data: CreateWoaDto[]) {
@@ -127,7 +129,14 @@ export class PrintFileService {
 
         const url = `${process.env.SHIPPING_URL}?label_designer_code=${encodeURIComponent(label_designer_code)}&facility_id__code=${encodeURIComponent(facility_id__code)}&company_id__code=${encodeURIComponent(company_id__code)}&container_nbr__in=${encodeURIComponent(container_nbr__in)}`;
         this.logger.logError(`URL SHIPPING: ${url}`);
-        const response = await this.apiService.requestWithRetriesTime('GET', url, { headers : headers }, data_count > 200);
+
+        let response: unknown;
+        try {
+          response = await this.apiService.requestWithRetriesTime('GET', url, { headers : headers }, data_count > 200);
+        } catch (error) {
+          await this.recordLabelsShippingHttpError(container_nbr__in, error, requestedOblpns, url);
+          return;
+        }
 
         if(response) {
           this.logger.logError(`getDataShipping response = ${JSON.stringify(response, null, 2)}`);
@@ -290,5 +299,52 @@ export class PrintFileService {
 
     validateNullString(text: string | undefined) {
       return text === undefined || (typeof text === 'string' && text.replace(/^\s+/, '').length == 0);
+    }
+
+    private async recordLabelsShippingHttpError(
+      container_nbr__in: string,
+      error: unknown,
+      requestedOblpns: string[],
+      requestUrl: string,
+    ): Promise<void> {
+      const detail = this.buildShippingHttpErrorDetail(error, requestedOblpns, requestUrl);
+      try {
+        const traceId = await this.traceService.create('LABELS_ERROR', container_nbr__in, detail);
+        this.logger.logError(`getDataShipping - Trace LABELS_ERROR registrado, traceId=${traceId}, container_nbr__in=${container_nbr__in}`);
+      } catch (traceErr) {
+        this.logger.logError(
+          `getDataShipping - No se pudo registrar Trace LABELS_ERROR: ${(traceErr as Error).message}`,
+          (traceErr as Error).stack,
+        );
+      }
+    }
+
+    private buildShippingHttpErrorDetail(
+      error: unknown,
+      requestedOblpns: string[],
+      requestUrl: string,
+    ): string {
+      const payload: Record<string, unknown> = {
+        requestedOblpns,
+        requestUrl,
+      };
+      if (error instanceof HttpException) {
+        payload.httpExceptionStatus = error.getStatus();
+        payload.httpExceptionResponse = error.getResponse();
+      }
+      if (error && typeof error === 'object') {
+        const e = error as Error & { code?: string; response?: { data?: unknown; status?: number } };
+        payload.message = e.message;
+        if (e.code) {
+          payload.code = e.code;
+        }
+        if (e.response) {
+          payload.responseData = e.response.data;
+          payload.responseStatus = e.response.status;
+        }
+      } else {
+        payload.raw = String(error);
+      }
+      return JSON.stringify(payload, null, 2);
     }
 }

@@ -236,11 +236,15 @@ export class IhtService {
                   groupValidSet.add(dto.group_nbr);
                 }
                 else {
-                  this.logger.logError(`procesaGrupo - no se envía la trama a kisoft del grupo: ${dto.group_nbr} debido a que el campo location:${nbrWithCode4?.location} no cumple con las reglas`);
+                  const msgLocationRules = `procesaGrupo - no se envía la trama a kisoft del grupo: ${dto.group_nbr} debido a que el campo location:${nbrWithCode4?.location} no cumple con las reglas`;
+                  this.logger.logError(msgLocationRules);
+                  await this.recordIhtNoProcessTrace(msgLocationRules, data);
                 }
               }
               else{
-                this.logger.logError(`procesaGrupo - no se envía trama a kisoft del grupo: ${dto.group_nbr} porque no tiene el campo el activity_code = 4 o no tiene el campo location`);
+                const msgMissingActivityOrLocation = `procesaGrupo - no se envía trama a kisoft del grupo: ${dto.group_nbr} porque no tiene el campo el activity_code = 4 o no tiene el campo location`;
+                this.logger.logError(msgMissingActivityOrLocation);
+                await this.recordIhtNoProcessTrace(msgMissingActivityOrLocation, data);
               }
 
               if(groupValidSet.has(dto.group_nbr)) {
@@ -409,6 +413,19 @@ export class IhtService {
     catch(error) {
       this.logger.logError(`Error al construir trama kisoft - group_nbr = ${createIhtDto.group_nbr}, error: ${error.message}`, error.stack);
       return '';
+    }
+  }
+
+  private async recordIhtNoProcessTrace(tramaReceived: string, data: CreateIhtDto[]): Promise<void> {
+    const detail = JSON.stringify(data, null, 2);
+    try {
+      const traceId = await this.traceService.createReceived('IHT_NO_PROCESS', tramaReceived, detail);
+      this.logger.logError(`procesaGrupo - trace IHT_NO_PROCESS registrado, traceId=${traceId}`);
+    } catch (err) {
+      this.logger.logError(
+        `procesaGrupo - error al registrar trace IHT_NO_PROCESS: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
     }
   }
 

@@ -12,11 +12,24 @@ export class TraceService {
       private readonly traceRepository:  Repository<Trace>)
   {}
 
-  async create(interfaceIntegrator: string, tramaSent: string, detail) 
-  {
+  async create(interfaceIntegrator: string, tramaSent: string, detail) {
     const dto: CreateTraceDto = {
       Interface: interfaceIntegrator,
       TramaSent: tramaSent,
+      Detail: detail,
+      CreatedDate: new Date(),
+      CreatedUser: 3
+    };
+
+    const articleEntity = this.traceRepository.create(dto);
+    await this.traceRepository.save(articleEntity);
+    return articleEntity.Id;
+  }
+
+  async createReceived(interfaceIntegrator: string, tramaReceived: string, detail) {
+    const dto: CreateTraceDto = {
+      Interface: interfaceIntegrator,
+      TramaReceived: tramaReceived,
       Detail: detail,
       CreatedDate: new Date(),
       CreatedUser: 3
