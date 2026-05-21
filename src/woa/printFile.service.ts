@@ -12,6 +12,7 @@ import { SequenceDetailService } from "./secuence-detail.service";
 import { WoaCalculationService } from "./woa-calculation.service";
 import { WoaConfigService } from "./config/woa-config.service";
 import { TraceService } from "src/trace/trace.service";
+import { joinSftpRemotePath } from "src/shared/utils/sftp-path.util";
 
 
 @Injectable()
@@ -243,7 +244,7 @@ export class PrintFileService {
             }
 
             // Upload SFTP del archivo principal
-            const remotePrintFilePath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileName);
+            const remotePrintFilePath = joinSftpRemotePath(process.env.SFTP_PRINT_PATH_FILES, fileName);
             this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando upload SFTP del archivo principal: ${remotePrintFilePath}`);
             try {
                 await this.sftpService.uploadFile(remotePrintFilePath, filePath);
@@ -267,7 +268,7 @@ export class PrintFileService {
             }
 
             // Upload SFTP del archivo .end
-            const remotePrintFileEndPath = path.join(process.env.SFTP_PRINT_PATH_FILES, fileNameEnd);
+            const remotePrintFileEndPath = joinSftpRemotePath(process.env.SFTP_PRINT_PATH_FILES, fileNameEnd);
             this.logger.logError(`savePrintAndUploadFile - [OBLPN: ${oblpn_nbr}] Iniciando upload SFTP del archivo .end: ${remotePrintFileEndPath}`);
             try {
                 await this.sftpService.uploadFile(remotePrintFileEndPath, filePathEnd);

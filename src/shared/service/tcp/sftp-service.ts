@@ -3,13 +3,14 @@ import SftpClient from 'ssh2-sftp-client';
 import * as path from 'path';
 import { FileRemoveService } from '../file-remove.service';
 import { LoggerService } from '../../logger/logger.service';
+import { joinSftpRemotePath, normalizeSftpRemotePath } from '../../utils/sftp-path.util';
 
 @Injectable()
 export class SftpService implements OnModuleInit, OnModuleDestroy {
   private client: SftpClient;
   private readonly localPath = './' + process.env.DIRECTORY_FILES;
-  private readonly remotePath = process.env.SFTP_PATH;
-  private readonly remoteFileProcessedPath = process.env.SFTP_PATH_FILEPROCESSED;
+  private readonly remotePath = normalizeSftpRemotePath(process.env.SFTP_PATH);
+  private readonly remoteFileProcessedPath = normalizeSftpRemotePath(process.env.SFTP_PATH_FILEPROCESSED);
   private readonly intervalExecution = +process.env.EXECUTION_INTERVAL * 1000;
   
   constructor(private readonly fileRemoveService: FileRemoveService,
@@ -24,14 +25,14 @@ export class SftpService implements OnModuleInit, OnModuleDestroy {
 
     await this.connectToSftp();
 
-    await this.watchDirectory(process.env.SFTP_PATH);
+    await this.watchDirectory(this.remotePath);
 
     this.fileRemoveService.fileList$.subscribe(async fileList => {
       this.logger.logError(`'Lista de archivos remotos:', ${JSON.stringify(fileList, null, 2)}`);
 
       for (const fileName of fileList) {
-        const remoteFilePath = path.join(this.remotePath, fileName);
-        const remoteFileProcessedPath = path.join(this.remoteFileProcessedPath, fileName);
+        const remoteFilePath = joinSftpRemotePath(this.remotePath, fileName);
+        const remoteFileProcessedPath = joinSftpRemotePath(this.remoteFileProcessedPath, fileName);
         await this.moveFile(remoteFilePath, remoteFileProcessedPath);
       };
       
@@ -87,7 +88,7 @@ export class SftpService implements OnModuleInit, OnModuleDestroy {
         newFiles.forEach(async file => {
           if(file.includes('.csv')) {
             this.logger.logError(`Nuevo archivo encontrado: ${file}`);
-            const remoteFilePath = path.join(this.remotePath, file);
+            const remoteFilePath = joinSftpRemotePath(this.remotePath, file);
             const localFilePath = path.join(this.localPath, file);
             await this.downloadFile(remoteFilePath, localFilePath);            
           }         
