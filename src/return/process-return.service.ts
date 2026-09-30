@@ -10,6 +10,7 @@ import { TraceService } from "src/trace/trace.service";
 import { CreateWoaResponseDto } from "./dto/create-woa-response.dto";
 import { ReturnDto } from "./dto/return.dto";
 import { Woa } from "src/woa/entities/woa.entity";
+import { serializeWmsErrorForTrace, serializeWmsResponseForTrace } from "src/shared/utils/wms-trace.util";
 
 interface LoteCantidad {
   lote: string,
@@ -94,13 +95,20 @@ export class ProcessReturnService {
 
                 this.logger.logError("URL Return", process.env.PICK_CONFIRM_URL);
             
-                await this.traceService.update(traceId, JSON.stringify(xmlReturnObject, null, 2));
-        
-                const response = await this.xmlService.sendSoapRequest(xmlReturnObject, process.env.PICK_CONFIRM_URL, traceId);
-                this.logger.logError('WLMS SOAP response', JSON.stringify(response));
+                const xmlSent = JSON.stringify(xmlReturnObject, null, 2);
+                await this.traceService.update(traceId, xmlSent);
 
-                const tradIdReceived = await this.traceService.createReceived("PICK_CONFIRM", JSON.stringify(response), null);
-                this.logger.logError('WLMS response, tradIdReceived = ', tradIdReceived.toString());
+                const pickConfirmTraceId = await this.traceService.create("PICK_CONFIRM", xmlSent, '');
+
+                try {
+                    const response = await this.xmlService.sendSoapRequest(xmlReturnObject, process.env.PICK_CONFIRM_URL, traceId);
+                    this.logger.logError('WLMS SOAP response', JSON.stringify(response));
+                    await this.traceService.update(pickConfirmTraceId, serializeWmsResponseForTrace(response));
+                    this.logger.logError(`WLMS response, pickConfirmTraceId = ${pickConfirmTraceId.toString()}`);
+                } catch (error) {
+                    await this.traceService.update(pickConfirmTraceId, serializeWmsErrorForTrace(error));
+                    this.logger.logError(`Ocurrió un error al enviar PICK_CONFIRM a WMS: ${error.message}`, error.stack);
+                }
             }
         }
         else {
@@ -481,6 +489,8 @@ export class ProcessReturnService {
         //this.logger.logError(`buildXmlReturnStructureShortPick - con cant_return == 0 O w.cant_return < w.allocated_qty`, JSON.stringify(woaList, null, 2));
 
         let tramaList = [];
+        let skippedList = [];
+        const skipObLpnTypes = ['07', '11'];
 
         //this.logger.logError(`buildXmlReturnStructureShortPick - woaList`, JSON.stringify(woaList, null, 2));
 
@@ -490,6 +500,16 @@ export class ProcessReturnService {
 
             try
             {
+                if(skipObLpnTypes.includes(dto.ob_lpn_type)) {
+                    const skipMsg = `Skip Short Pick WMS - oblpn:${to_container_nbr} - ob_lpn_type:${dto.ob_lpn_type} - item:${dto.item_alternate_code} - qty:${qty}`;
+                    this.logger.logError(`tradId:${id} - ${skipMsg}`);
+                    skippedList.push(skipMsg);
+
+                    dto.cant_return = dto.allocated_qty;
+                    await this.woaService.updateWOA(dto);
+                    continue;
+                }
+
                 const xmlStructure = {
                 Request: {
                     mhe_mode_flg: 'true',
@@ -518,12 +538,17 @@ export class ProcessReturnService {
         
                 this.logger.logError(`tradId:${id} - URL Return`, process.env.PICK_CONFIRM_URL);
                 
+                const xmlSent = JSON.stringify(xmlStructure, null, 2);
+                const pickConfirmTraceId = await this.traceService.create("PICK_CONFIRM", xmlSent, '');
+
                 try
                 {
                     const response = await this.xmlService.sendSoapRequest(xmlStructure, process.env.PICK_CONFIRM_URL, id);
                     this.logger.logError(`tradId:${id} - SOAP response`, JSON.stringify(response));
+                    await this.traceService.update(pickConfirmTraceId, serializeWmsResponseForTrace(response));
                 }
                 catch(error) {
+                    await this.traceService.update(pickConfirmTraceId, serializeWmsErrorForTrace(error));
                     this.logger.logError(`tradId:${id} - Ocurrió un error buildXmlReturnStructureShortPick al enviar a WMS: ${error.message}`, error.stack);
                 }
                 
@@ -537,7 +562,10 @@ export class ProcessReturnService {
             }
         }
 
-        await this.traceService.update(id, `Se envía tramas Short Pick, ${tramaList.join('')}`);
+        const sentPart = tramaList.length > 0 ? `Se envía tramas Short Pick, ${tramaList.join('')}` : '';
+        const skippedPart = skippedList.length > 0 ? `Se omite Short Pick WMS (ob_lpn_type 07/11), ${skippedList.join(' | ')}` : '';
+        const traceMsg = [sentPart, skippedPart].filter(Boolean).join(' | ') || 'Sin tramas Short Pick pendientes';
+        await this.traceService.update(id, traceMsg);
     }
 
     limpiarNumero(valor: string): string {

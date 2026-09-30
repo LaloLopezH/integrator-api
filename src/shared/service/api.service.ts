@@ -1,7 +1,8 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { catchError, delay, firstValueFrom, lastValueFrom, map, mergeMap, of, retry, retryWhen, take, throwError, timer } from 'rxjs';
 import { LoggerService } from '../logger/logger.service';
+import { mapAxiosLikeErrorToHttpException } from '../utils/wms-trace.util';
 
 @Injectable()
 export class ApiService {
@@ -45,7 +46,7 @@ export class ApiService {
       return response.data;
     } catch (error) {
       this.logger.logError("Error connecting to API", error);
-      throw this.mapAxiosLikeErrorToHttpException(error);
+      throw mapAxiosLikeErrorToHttpException(error);
     }
   }
 
@@ -82,7 +83,7 @@ export class ApiService {
         catchError((error) => {
           this.logger.logError(`Error final después de reintentos - requestWithRetries - url:${url} - error:`, error.message);
           this.logger.logError(`requestWithRetries error: ${JSON.stringify(error, null, 2)}`);
-          throw this.mapAxiosLikeErrorToHttpException(error);
+          throw mapAxiosLikeErrorToHttpException(error);
         }),
       )
     );
@@ -140,41 +141,9 @@ export class ApiService {
           }
           
           this.logger.logError(JSON.stringify(error, null, 2));
-          throw this.mapAxiosLikeErrorToHttpException(error);
+          throw mapAxiosLikeErrorToHttpException(error);
         }),
       )
-    );
-  }
-
-  /**
-   * Incluye el `code` de Axios/Node (ECONNRESET, ETIMEDOUT, etc.) en el cuerpo del HttpException
-   * para que los consumidores (p. ej. Trace) puedan leerlo vía getResponse().
-   */
-  private mapAxiosLikeErrorToHttpException(error: any): HttpException {
-    const status = error?.response?.status ?? HttpStatus.INTERNAL_SERVER_ERROR;
-    const axiosCode = typeof error?.code === 'string' && error.code.length > 0 ? error.code : undefined;
-
-    if (error?.response?.data !== undefined && error?.response?.data !== null) {
-      const data = error.response.data;
-      if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
-        return new HttpException(
-          axiosCode ? { ...data, axiosErrorCode: axiosCode } : data,
-          status,
-        );
-      }
-      return new HttpException(
-        axiosCode ? { code: axiosCode, data } : data,
-        status,
-      );
-    }
-
-    return new HttpException(
-      {
-        message: 'Error connecting to API',
-        ...(axiosCode ? { code: axiosCode } : {}),
-        ...(typeof error?.message === 'string' ? { errorMessage: error.message } : {}),
-      },
-      status,
     );
   }
 }
