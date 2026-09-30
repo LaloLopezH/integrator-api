@@ -4,6 +4,7 @@ import axios from 'axios';
 import { LoggerService } from '../logger/logger.service';
 import util from 'util';
 import { from, lastValueFrom, retry, timer } from 'rxjs';
+import { mapAxiosLikeErrorToHttpException } from '../utils/wms-trace.util';
 
 @Injectable()
 export class XmlService {
@@ -26,10 +27,14 @@ constructor(private readonly logger: LoggerService){}
   }
 
   public async sendSoapRequest(xmlObject: any, wsdlUrl: string, traceId: number): Promise<any> {
-    const maxRetries = 3;
-    const delayMs = 30000; // 3 segundos entre intentos
+    const maxRetries = this.readPositiveInt('WMS_SOAP_MAX_RETRIES', 3);
+    const delayMs = this.readPositiveInt('WMS_SOAP_RETRY_DELAY_MS', 30000);
+    const timeoutMs = this.readPositiveInt('WMS_SOAP_TIMEOUT_MS', 25000);
 
     this.logger.logError(`sendSoapRequest - traceId:${traceId} - wsdlUrl = ${wsdlUrl}`);
+    this.logger.logError(
+      `sendSoapRequest - traceId:${traceId} - timeoutMs=${timeoutMs}, maxRetries=${maxRetries}, retryDelayMs=${delayMs}`,
+    );
 
     const builder = new xml2js.Builder({ headless: true });
     const xml = builder.buildObject(xmlObject);
@@ -50,7 +55,7 @@ constructor(private readonly logger: LoggerService){}
 
         this.sendXml = true;
         const response = await axios.post(wsdlUrl, xmlClean, {
-          timeout: 10000,
+          timeout: timeoutMs,
           headers: {
             'Authorization': `Basic ${Buffer.from(`${process.env.API_WMS_USER}:${process.env.API_WMS_PASSWORD}`).toString('base64')}`,
             'Content-Type': 'application/xml; text/xml; charset=utf-8',
@@ -66,13 +71,11 @@ constructor(private readonly logger: LoggerService){}
           }
           else {
             this.logger.logError(`Respuesta del api - traceId:${traceId}, URL=${wsdlUrl}`, util.inspect(response, { depth: null }));
-            return response.data;
           }
-        }
-        else {
-          this.logger.logError(`****ERROR: traceId:${traceId} - No se obtuvo respuesta del api`);
+          return response.data;
         }
 
+        this.logger.logError(`****ERROR: traceId:${traceId} - No se obtuvo respuesta del api`);
         this.logger.logError(`sendSoapRequest - finalizando - traceId:${traceId}`);
         this.sendXml = false;
         return null;
@@ -95,7 +98,7 @@ constructor(private readonly logger: LoggerService){}
           await this.delay(delayMs);
         } else {
           this.logger.logError(`traceId:${traceId} - Se alcanzó el número máximo de intentos (${maxRetries}) de enviar el xml al api.`);
-          return null;
+          throw mapAxiosLikeErrorToHttpException(error);
         }
       }
       finally {
@@ -149,6 +152,15 @@ constructor(private readonly logger: LoggerService){}
       );
       throw error;
     }
+  }
+
+  private readPositiveInt(envKey: string, defaultValue: number): number {
+    const raw = process.env[envKey];
+    if (raw == null || raw === '') {
+      return defaultValue;
+    }
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : defaultValue;
   }
 
   private async delay(ms: number): Promise<void> {

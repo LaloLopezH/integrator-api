@@ -13,6 +13,7 @@ import { WoaCalculationService } from "./woa-calculation.service";
 import { WoaConfigService } from "./config/woa-config.service";
 import { TraceService } from "src/trace/trace.service";
 import { joinSftpRemotePath } from "src/shared/utils/sftp-path.util";
+import { serializeWmsErrorForTrace } from "src/shared/utils/wms-trace.util";
 
 
 @Injectable()
@@ -311,6 +312,7 @@ export class PrintFileService {
       const detail = this.buildShippingHttpErrorDetail(error, requestedOblpns, requestUrl);
       try {
         const traceId = await this.traceService.create('LABELS_ERROR', container_nbr__in, detail);
+        await this.traceService.update(traceId, serializeWmsErrorForTrace(error));
         this.logger.logError(`getDataShipping - Trace LABELS_ERROR registrado, traceId=${traceId}, container_nbr__in=${container_nbr__in}`);
       } catch (traceErr) {
         this.logger.logError(
